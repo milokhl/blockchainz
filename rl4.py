@@ -1,3 +1,5 @@
+# Uses 10 different actions as amounts, and a 'sign' output which controls buy/sell
+
 import pandas as pd
 import numpy as np
 
@@ -26,45 +28,41 @@ class State(object):
     self.coin = params['starting_coin']
     self.trade_unit = self.capital / 50 # USD
 
-  def simulateAction(self, action):
-    # get close price when action was taken
+  def simulateAction(self, action, sign):
     close_price = self.data[self.timestep][0]
 
-    if (action == 0 or close_price < 0.01):
-      self.signal[self.timestep] = 0
+    # prevent divide by zero bugs
+    if close_price > 0.01:
+      if sign > 0:
+      	usd_amt = min(action * 0.1 * close_price, self.capital)
+      	coin_amt = usd_amt / close_price
+      	self.capital -= usd_amt
+      	self.coin += coin_amt
+      	self.signal[self.timestep] = coin_amt
 
-    # spend 1 trade_unit of capital
-    elif (action == 1):
-      if (self.capital > 0):
-        usd_amt = float(min(self.trade_unit, self.capital))
-        coin_amt = usd_amt / close_price
-        self.signal[self.timestep] = coin_amt
-        self.capital -= usd_amt
-        self.coin += coin_amt
+      elif sign < 0:
+      	coin_amt = min(self.coin, action * 0.1)
+      	usd_amt = coin_amt * close_price
+      	self.capital += usd_amt
+      	self.coin -= coin_amt
+      	self.signal[self.timestep] = -1 * coin_amt
+
       else:
-        self.signal[self.timestep] = 0
-
-    # sell of 1 trade_unit worth of coin
-    elif (action == 2):
-      coin_amt = float(min(self.trade_unit / close_price, self.coin))
-      usd_amt = coin_amt * close_price
-      self.signal[self.timestep] = -1 * coin_amt
-      self.coin -= coin_amt
-      self.capital += usd_amt
-
-    # sell all coin
-    elif (action == 3):
-      self.signal[self.timestep] = -1 * self.coin
-      self.capital += self.coin * close_price
-      self.coin = 0
-
+      	print "Probably an error: sign=", sign
     self.timestep += 1
+
+  def getClose(self, step=0):
+  	return self.data[self.timestep + step][0]
 
   def getReward(self):
     reward = 0
     close = self.data[self.timestep][0]
     prev_close = self.data[self.timestep-1][0]
     reward += (close - prev_close) * self.coin
+
+    # simulate small tx fee
+    if abs(self.signal[self.timestep-1]) > 0:
+    	reward -= 0.02 * abs(self.signal[self.timestep-1])
     return reward
 
   def getState(self):
@@ -76,6 +74,7 @@ class State(object):
     close = self.data[self.timestep][0]
     assets = self.capital + self.coin * close
     return 'Timestep: %d Capital: %f Coin: %f Close: %f Assets: %f' % (self.timestep, self.capital, self.coin, close, assets)
+
 
 def load_data():
   btc_path = '../datasets/bitcoin'
@@ -100,12 +99,10 @@ def load_data():
   data = np.nan_to_num(data)
   return data, df, daily_mean
 
-TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
 
-# print BTC_DATA_MIN.isnull().sum()
-# print BTC_DATA_DAY.isnull().sum()
-# BTC_DATA_DAY.plot(y='close')
-# plt.show()
+def countNanValues(df):
+	return df.isnull().sum()
+
 
 def evaluate_performance(data, model):
   CurrentState = State(data, params)
@@ -113,17 +110,18 @@ def evaluate_performance(data, model):
 
   for step in range(data.shape[0]-1):
     state = CurrentState.getState() # (price, diff)
-    # print CurrentState
-    Q_values = model.predict(state)
+    Q_values, sign = model.predict(state)
     action_id = np.argmax(Q_values)
-    CurrentState.simulateAction(action_id)
+    CurrentState.simulateAction(action_id, sign)
     reward = CurrentState.getReward()
     totalReward += reward
 
   return totalReward, CurrentState
 
+
 # Params
-num_actions = 4
+TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
+num_actions = 10
 num_features = 9
 epochs = 20
 gamma = 0.95
@@ -131,51 +129,48 @@ epsilon = 1.0 # decreases over time
 learning_progress = []
 verbose = False
 print_state = False
-params = {'starting_capital': 10000, 'starting_coin': 0}
+params = {'starting_capital': 100000, 'starting_coin': 0}
 
-# Define model
-model = Sequential()
+from keras.layers import Input, Dense
+from keras.models import Model
 
-model.add(Dense(16, init='lecun_uniform', input_shape=(num_features,)))
-model.add(Activation('relu'))
-model.add(Dropout(0.5))
-
-model.add(Dense(16, init='lecun_uniform'))
-model.add(Activation('relu'))
-model.add(Dropout(0.5))
-
-model.add(Dense(16, init='lecun_uniform'))
-model.add(Activation('relu'))
-model.add(Dropout(0.5))
-
-model.add(Dense(num_actions, init='lecun_uniform'))
-model.add(Activation('linear'))
+# This returns a tensor
+inputs = Input(shape=(num_features,))
+x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(inputs)
+x = Dropout(0.4)(x)
+x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(x)
+x = Dropout(0.4)(x)
+x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(x)
+x = Dropout(0.4)(x)
+x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(x)
+actions = Dense(num_actions, activation='linear', name='actions_output')(x)
+sign = Dense(1, activation='tanh', name='sign_output')(x)
+model = Model(inputs=inputs, outputs=[actions, sign])
 rms = RMSprop()
-model.compile(loss='mse', optimizer=rms)
+model.compile(optimizer=rms, loss='mse')
 
 signal_list = []
 for epoch in range(epochs):
   CurrentState = State(TRAINING_DATA, params)
-  if verbose: print('Epoch:', epoch)
 
   for step in range(TRAINING_DATA.shape[0]-1):
     state = CurrentState.getState() # (price, diff)
     if verbose: print('State:', state)
-    Q_values = model.predict(state)
+    Q_values, sign = model.predict(state)
+
     if verbose: print('Q_values:', Q_values)
 
-    # choose random action with some probability
     if (random.random() < epsilon):
       action_id = np.random.randint(0, num_actions)
+      sign = np.random.choice([-1, 1])
     else:
       action_id = np.argmax(Q_values)
 
-    if verbose: print('Taking action:', action_id)
+    if verbose: print('Taking action:', action_id, sign)
 
     # go to the next state by performing action
-    CurrentState.simulateAction(action_id)
+    CurrentState.simulateAction(action_id, sign)
     reward = CurrentState.getReward()
-
     if verbose: print('Reward:', reward)
 
     y = np.copy(Q_values)
@@ -185,13 +180,18 @@ for epoch in range(epochs):
     else:
       # reward + discounted reward at next state
       next_state = CurrentState.getState()
-      Q_values_next = model.predict(next_state)
+      Q_values_next, sign_next = model.predict(next_state)
       Q_max = np.max(Q_values_next)
       y[0][action_id] = reward + (gamma * Q_max)
 
     if verbose: print('Q_values_update:', y)
 
-    model.fit(state, y, batch_size=1, epochs=1, verbose=0)
+    if (CurrentState.getClose(step=0) - CurrentState.getClose(step=-1) > 0):
+    	correct_sign = np.ones(1)
+    else:
+    	correct_sign = -1 * np.ones(1)
+
+    model.fit(state, {'actions_output': y, 'sign_output': correct_sign}, batch_size=1, epochs=1, verbose=0)
 
   totalReward, finalState = evaluate_performance(TRAINING_DATA, model)
   signal_list.append(CurrentState.signal)
