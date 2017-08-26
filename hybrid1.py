@@ -15,6 +15,8 @@ import random, os, sys
 
 from talib.abstract import *
 
+from collections import deque
+
 matplotlib.style.use('ggplot')
 
 def plot_trades(price_series, signal_series):
@@ -38,6 +40,32 @@ def plot_trades(price_series, signal_series):
     price_series[sell_idx].plot(style='go')
 
   plt.show()
+
+class ExperienceReplay(object):
+  def __init__(self, window_size, num_features, num_actions):
+    self.window_size = window_size
+    self.buffer = deque(maxlen=window_size)
+    self.weights = deque(maxlen=window_size)
+    self.num_features = num_features
+    self.num_actions = num_actions
+
+  def bufferAppend(self, item):
+    self.buffer.append(item)
+    error = np.linalg.norm(item[2] - item[1])
+    self.weights.append(error)
+
+  def getBatch(self, batch_size):
+    normalized_weights = self.weights / np.sum(self.weights)
+    indices = np.random.choice(len(self.weights), batch_size, p=normalized_weights)
+    X = np.zeros((batch_size, 1, num_features))
+    y = np.zeros((batch_size, num_actions))
+    ctr = 0
+    for i in indices:
+      X[ctr] = self.buffer[i][0]
+      y[ctr] = self.buffer[i][1]
+      ctr += 1
+    return X, y
+
 
 class State(object):
   def __init__(self, data, data_norm, params):
@@ -71,7 +99,7 @@ class State(object):
 
       # buy BTC
       elif action == 1:
-        usd_amt = min(200, self.capital)
+        usd_amt = min(100, self.capital)
         # usd_amt = 200
         coin_amt = usd_amt / close_price
         self.capital -= usd_amt
@@ -80,7 +108,7 @@ class State(object):
 
       # sell BTC
       else:
-        usd_amt = min(self.coin * close_price, 200)
+        usd_amt = min(self.coin * close_price, 100)
         # usd_amt = 200
         coin_amt = usd_amt / close_price
       	self.capital += usd_amt
@@ -94,9 +122,7 @@ class State(object):
   	return self.data[self.timestep + step][0]
 
   def getReward(self):
-    """
-    Percentage increase / decrease in portfolio value.
-    """
+    # Percentage increase / decrease in portfolio value.
     close = self.data[self.timestep][0]
     prev_close = self.data[self.timestep-1][0]
     reward = (self.pvalue[self.timestep] - self.pvalue[self.timestep-1]) / self.init_portfolio_value
@@ -104,10 +130,8 @@ class State(object):
     # simulate small tx fee (normalized)
     if self.signal[self.timestep-1] > 0:
       reward -= (0.01 * abs(self.signal[self.timestep-1]) * prev_close) / self.init_portfolio_value
-
     elif self.signal[self.timestep-1] < 0:
       reward -= 2.5 / self.init_portfolio_value # coinbase $2.50 charge
-
     if (self.coin == 0 or self.capital == 0):
       reward -= 0.01
 
@@ -185,8 +209,6 @@ def evaluate_performance(data, data_norm, model, verbose=True):
     totalReward += reward
 
   plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal)
-  # plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
-
   return totalReward, CurrentState
 
 # Params
@@ -199,76 +221,73 @@ epsilon = 1.0 # decreases over time
 learning_progress = []
 verbose = False
 print_state = False
-params = {'starting_capital': 10000, 'starting_coin': 0}
+params = {'starting_capital': 10000, 'starting_coin': 0.5}
 iters = 10
 hidden_units = 32
+batch_size = 16
+xp_window_size = 32
 
 from keras.layers import Input, Dense
 from keras.models import Model
 
-# one model for prediction
-inputs = Input(shape=(1, num_features,))
-x = LSTM(hidden_units, input_shape=(1, num_features), return_sequences=True)(inputs)
-x = LSTM(hidden_units, return_sequences=True)(x)
-x = LSTM(hidden_units)(x)
-x = Dense(hidden_units, activation='relu', kernel_initializer='lecun_uniform')(x)
-actions = Dense(num_actions, activation='linear', name='actions_output')(x)
-Model1 = Model(inputs=inputs, outputs=actions)
-optimizer = Adam()
-Model1.compile(optimizer=optimizer, loss='mse')
+def build_model():
+  inputs = Input(shape=(1, num_features,))
+  x = LSTM(hidden_units, input_shape=(1, num_features), return_sequences=True)(inputs)
+  x = LSTM(hidden_units, return_sequences=True)(x)
+  x = LSTM(hidden_units)(x)
+  x = Dense(hidden_units, activation='relu', kernel_initializer='lecun_uniform')(x)
+  actions = Dense(num_actions, activation='linear', name='actions_output')(x)
+  model = Model(inputs=inputs, outputs=actions)
+  optimizer = Adam(lr=0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+  model.compile(optimizer=optimizer, loss='mse')
+  return model
 
-# another model for weight updates
-inputs = Input(shape=(1, num_features,))
-x = LSTM(hidden_units, input_shape=(1, num_features), return_sequences=True)(inputs)
-x = LSTM(hidden_units, return_sequences=True)(x)
-x = LSTM(hidden_units)(x)
-x = Dense(hidden_units, activation='relu', kernel_initializer='lecun_uniform')(x)
-actions = Dense(num_actions, activation='linear', name='actions_output')(x)
-Model2 = Model(inputs=inputs, outputs=actions)
-optimizer = Adam()
-Model2.compile(optimizer=optimizer, loss='mse')
+Model1 = build_model()
+Model2 = build_model()
 
 signal_list = []
 PredictModel = Model1
 UpdateModel = Model2
 
-for iteration in range(iters):
+# main loop
+for iteration in range(iters): # each iteration switches between the two models
   epsilon = 1.0
-  for epoch in range(epochs):
+  for epoch in range(epochs): # each epoch is one progression through the training data
     CurrentState = State(TRAINING_DATA, TRAINING_DATA_NORM, params)
+    ExpReplay = ExperienceReplay(xp_window_size, num_features, num_actions)
 
     for step in range(TRAINING_DATA.shape[0]-1):
-      state = CurrentState.getState() # (price, diff)
-      if verbose: print('State:', state)
+      state = CurrentState.getState()
       Q_values = PredictModel.predict(state)
-
-      if verbose: print('Q_values:', Q_values)
 
       if (random.random() < epsilon):
         action_id = np.random.randint(0, num_actions)
       else:
         action_id = np.argmax(Q_values)
 
-      if verbose: print('Taking action:', action_id)
-
       # go to the next state by performing action
       CurrentState.simulateAction(action_id)
       reward = CurrentState.getReward()
-      if verbose: print('Reward:', reward)
 
       y = np.copy(Q_values)
-      if CurrentState.timestep == (CurrentState.steps-1): # terminal state
-        y[0][action_id] = reward # need to use 0 index because 2d array
 
+      # if terminal state, no discounted future reward
+      if CurrentState.timestep == (CurrentState.steps-1):
+        y[0][action_id] = reward # zero index needed because array is 2D
+
+      # total reward = immediate reward + discounted reward at next state
       else:
-        # reward + discounted reward at next state
         next_state = CurrentState.getState()
         Q_values_next = PredictModel.predict(next_state)
         Q_max = np.max(Q_values_next)
         y[0][action_id] = reward + (gamma * Q_max)
 
-      if verbose: print('Q_values_update:', y)
-      UpdateModel.fit(state, y, batch_size=1, epochs=1, verbose=0)
+      # get a batch from the experience replay and fit
+      ExpReplay.bufferAppend((state, y, Q_values)) # state, actual, predicted
+
+      if len(ExpReplay.buffer) >= batch_size:
+        X_batch, y_batch = ExpReplay.getBatch(batch_size)
+        UpdateModel.fit(X_batch, y_batch, batch_size=batch_size, epochs=1, verbose=0)
 
     totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel)
     signal_list.append(CurrentState.signal)
