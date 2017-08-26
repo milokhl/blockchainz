@@ -125,13 +125,13 @@ class State(object):
     # Percentage increase / decrease in portfolio value.
     close = self.data[self.timestep][0]
     prev_close = self.data[self.timestep-1][0]
-    reward = (self.pvalue[self.timestep] - self.pvalue[self.timestep-1]) / self.init_portfolio_value
+    reward = (self.pvalue[self.timestep] - self.pvalue[self.timestep-1]) / self.pvalue[self.timestep-1]
 
     # simulate small tx fee (normalized)
     if self.signal[self.timestep-1] > 0:
-      reward -= (0.01 * abs(self.signal[self.timestep-1]) * prev_close) / self.init_portfolio_value
+      reward -= (0.01 * abs(self.signal[self.timestep-1]) * prev_close) / self.pvalue[self.timestep-1]
     elif self.signal[self.timestep-1] < 0:
-      reward -= 2.5 / self.init_portfolio_value # coinbase $2.50 charge
+      reward -= 2.5 / self.pvalue[self.timestep-1] # coinbase $2.50 charge
     if (self.coin == 0 or self.capital == 0):
       reward -= 0.01
 
@@ -216,8 +216,8 @@ TRAINING_DATA_NORM, TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
 num_actions = 3
 num_features = 11
 epochs = 5
-gamma = 0.90
-epsilon = 1.0 # decreases over time
+gamma = 0.93
+epsilon = 1.0
 learning_progress = []
 verbose = False
 print_state = False
@@ -300,7 +300,6 @@ for iteration in range(iters): # each iteration switches between the two models
 
   # swap the pair of models
   PredictModel, UpdateModel = UpdateModel, PredictModel
-  # plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
 
 # plot the last (hopefully best) set of signals against price
 plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
