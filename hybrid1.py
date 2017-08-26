@@ -99,8 +99,9 @@ class State(object):
 
       # buy BTC
       elif action == 1:
-        usd_amt = min(100, self.capital)
+        # usd_amt = min(100, self.capital)
         # usd_amt = 200
+        usd_amt = 100
         coin_amt = usd_amt / close_price
         self.capital -= usd_amt
         self.coin += coin_amt
@@ -134,7 +135,6 @@ class State(object):
       reward -= 2.5 / self.pvalue[self.timestep-1] # coinbase $2.50 charge
     if (self.coin == 0 or self.capital == 0):
       reward -= 0.01
-
     return reward * 100
 
   def getState(self):
@@ -191,7 +191,7 @@ def countNanValues(df):
 	return df.isnull().sum()
 
 
-def evaluate_performance(data, data_norm, model, verbose=True):
+def evaluate_performance(data, data_norm, model, verbose=False):
   if verbose: print '----- Evaluating performance -----'
   CurrentState = State(data, data_norm, params)
   totalReward = 0
@@ -208,21 +208,21 @@ def evaluate_performance(data, data_norm, model, verbose=True):
     if verbose: print 'Reward:', reward
     totalReward += reward
 
-  plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal)
+  if verbose: plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal)
   return totalReward, CurrentState
 
 # Params
 TRAINING_DATA_NORM, TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
 num_actions = 3
 num_features = 11
-epochs = 5
+epochs = 10
 gamma = 0.93
 epsilon = 1.0
 learning_progress = []
 verbose = False
 print_state = False
 params = {'starting_capital': 10000, 'starting_coin': 0.5}
-iters = 10
+iters = 5
 hidden_units = 32
 batch_size = 16
 xp_window_size = 32
@@ -233,6 +233,7 @@ from keras.models import Model
 def build_model():
   inputs = Input(shape=(1, num_features,))
   x = LSTM(hidden_units, input_shape=(1, num_features), return_sequences=True)(inputs)
+  x = LSTM(hidden_units, return_sequences=True)(x)
   x = LSTM(hidden_units, return_sequences=True)(x)
   x = LSTM(hidden_units)(x)
   x = Dense(hidden_units, activation='relu', kernel_initializer='lecun_uniform')(x)
@@ -245,13 +246,13 @@ def build_model():
 Model1 = build_model()
 Model2 = build_model()
 
-signal_list = []
 PredictModel = Model1
 UpdateModel = Model2
 
 # main loop
 for iteration in range(iters): # each iteration switches between the two models
   epsilon = 1.0
+  signal_list = []
   for epoch in range(epochs): # each epoch is one progression through the training data
     CurrentState = State(TRAINING_DATA, TRAINING_DATA_NORM, params)
     ExpReplay = ExperienceReplay(xp_window_size, num_features, num_actions)
@@ -295,11 +296,12 @@ for iteration in range(iters): # each iteration switches between the two models
     print finalState
 
     # slowly reduce epsilon as model gets smarter
-    if epsilon > 0.1:
+    if epsilon > 0.2:
       epsilon -= (1.0/epochs)
 
   # swap the pair of models
   PredictModel, UpdateModel = UpdateModel, PredictModel
+  plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
 
 # plot the last (hopefully best) set of signals against price
 plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
