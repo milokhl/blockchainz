@@ -15,6 +15,28 @@ from talib.abstract import *
 
 matplotlib.style.use('ggplot')
 
+def plot_trades(price_series, signal_series):
+  price_series.plot(style='x-')
+
+  none = signal_series == 0
+  buy = signal_series > 0
+  sell = signal_series < 0
+
+  none_idx = none[none].index
+  buy_idx = buy[buy].index
+  sell_idx = sell[sell].index
+
+  if none_idx.any():
+    price_series[none_idx].plot(style='bo')
+
+  if buy_idx.any():
+    price_series[buy_idx].plot(style='ro')
+
+  if sell_idx.any():
+    price_series[sell_idx].plot(style='go')
+
+  plt.show()
+
 class State(object):
   def __init__(self, data, params):
     self.steps = data.shape[0]
@@ -63,8 +85,8 @@ class State(object):
     reward += (close - prev_close) * self.coin
 
     # simulate small tx fee
-    if self.signal[self.timestep-1] > 0:
-    	reward -= 0.02 * abs(self.signal[self.timestep-1]) * prev_close
+    if self.signal[self.timestep-1] != 0:
+    	reward -= 0.01 * abs(self.signal[self.timestep-1]) * prev_close
     return reward
 
   def getState(self):
@@ -88,6 +110,7 @@ def load_data():
   df['timestamp'] = df.index
   df.index = pd.to_datetime(df.index, unit='s')
   daily_mean = df.resample('D').mean()
+  daily_mean = daily_mean.fillna(method='ffill')
 
   close = daily_mean['close'].values
   diff = np.diff(close)
@@ -106,7 +129,8 @@ def countNanValues(df):
 	return df.isnull().sum()
 
 
-def evaluate_performance(data, model):
+def evaluate_performance(data, model, verbose=True):
+  if verbose: print '----- Evaluating performance -----'
   CurrentState = State(data, params)
   totalReward = 0
 
@@ -114,9 +138,16 @@ def evaluate_performance(data, model):
     state = CurrentState.getState() # (price, diff)
     Q_values = model.predict(state)
     action_id = np.argmax(Q_values)
+    if verbose: print 'State:', CurrentState
+    if verbose: print 'Qvalues:', Q_values
+    if verbose: print 'Action:', action_id
     CurrentState.simulateAction(action_id)
     reward = CurrentState.getReward()
+    if verbose: print 'Reward:', reward
     totalReward += reward
+
+  plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal)
+  # plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
 
   return totalReward, CurrentState
 
@@ -125,7 +156,7 @@ def evaluate_performance(data, model):
 TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
 num_actions = 11
 num_features = 9
-epochs = 15
+epochs = 10
 gamma = 0.95
 epsilon = 1.0 # decreases over time
 learning_progress = []
@@ -136,15 +167,14 @@ params = {'starting_capital': 100000, 'starting_coin': 0}
 from keras.layers import Input, Dense
 from keras.models import Model
 
-# This returns a tensor
 inputs = Input(shape=(num_features,))
-x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(inputs)
+x = Dense(32, activation='relu', kernel_initializer='lecun_uniform')(inputs)
 # x = Dropout(0.4)(x)
-x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(x)
+x = Dense(32, activation='relu', kernel_initializer='lecun_uniform')(x)
 # x = Dropout(0.4)(x)
-x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(x)
+x = Dense(32, activation='relu', kernel_initializer='lecun_uniform')(x)
 # x = Dropout(0.4)(x)
-x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(x)
+x = Dense(32, activation='relu', kernel_initializer='lecun_uniform')(x)
 actions = Dense(num_actions, activation='linear', name='actions_output')(x)
 model = Model(inputs=inputs, outputs=actions)
 optimizer = Adam()
@@ -196,27 +226,6 @@ for epoch in range(epochs):
   if epsilon > 0.1:
     epsilon -= (1.0/epochs)
 
-def plot_trades(price_series, signal_series):
-  price_series.plot(style='x-')
-
-  none = signal_series == 0
-  buy = signal_series > 0
-  sell = signal_series < 0
-
-  none_idx = none[none].index
-  buy_idx = buy[buy].index
-  sell_idx = sell[sell].index
-
-  if none_idx.any():
-    price_series[none_idx].plot(style='bo')
-
-  if buy_idx.any():
-    price_series[buy_idx].plot(style='ro')
-
-  if sell_idx.any():
-    price_series[sell_idx].plot(style='go')
-
-  plt.show()
 
 # plot the last (hopefully best) set of signals against price
 plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
