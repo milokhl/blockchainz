@@ -13,7 +13,8 @@ from sklearn.preprocessing import MinMaxScaler
 
 import random, os, sys
 
-from talib.abstract import *
+# from talib.abstract import *
+import talib
 
 from collections import deque
 
@@ -87,7 +88,7 @@ class State(object):
     self.pvalue = pd.Series(np.zeros(self.steps)) # stores the portfolio value over time
     self.pvalue[0] = self.init_portfolio_value
 
-    self.trade_unit = self.capital / 50 # USD
+    self.trade_unit = self.capital / 100 # USD
 
   def getPortfolioValue(self):
     return self.capital + self.coin * self.data[self.timestep][0]
@@ -102,9 +103,7 @@ class State(object):
 
       # buy BTC
       elif action == 1:
-        # usd_amt = min(100, self.capital)
-        # usd_amt = 200
-        usd_amt = 100
+        usd_amt = min(self.trade_unit, self.capital)
         coin_amt = usd_amt / close_price
         self.capital -= usd_amt
         self.coin += coin_amt
@@ -112,8 +111,7 @@ class State(object):
 
       # sell BTC
       else:
-        usd_amt = min(self.coin * close_price, 100)
-        # usd_amt = 200
+        usd_amt = min(self.coin * close_price, self.trade_unit)
         coin_amt = usd_amt / close_price
       	self.capital += usd_amt
       	self.coin -= coin_amt
@@ -142,7 +140,7 @@ class State(object):
 
   def getState(self):
     state = self.data_norm[self.timestep]
-    full_state = np.concatenate((state, np.array([self.capital / self.params['starting_capital']])))
+    full_state = np.concatenate((state, np.array([float(self.capital) / self.params['starting_capital']])))
     return full_state.reshape(1, 1, 11)
 
   def __repr__(self):
@@ -152,43 +150,60 @@ class State(object):
 
 
 def load_data():
-  btc_path = '../datasets/bitcoin'
-  btc_file = 'coinbaseUSD_1-min_data_2014-12-01_to_2017-05-31.csv'
-  full_path = os.path.join(btc_path, btc_file)
+  coin_path = '../datasets/popular_coins'
 
-  df = pd.read_csv(full_path, sep=",", skiprows=0, header=0, index_col=0, parse_dates=True,
-                       names=['timestamp', 'open', 'high', 'low', 'close', 'vol_btc', 'vol_usd', 'weighted_price'])
-  df['timestamp'] = df.index
-  df.index = pd.to_datetime(df.index, unit='s')
-  daily_mean = df.resample('D').mean()
-  daily_mean = daily_mean.fillna(method='ffill')
+  btc_file = 'bitcoin_price.csv'
+  ltc_file = 'litecoin_price.csv'
+  xrp_file = 'ripple_price.csv'
+  iota_file = 'iota_price.csv'
+  eth_file = 'ethereum_price.csv'
 
-  close = daily_mean['close'].values
-  diff = np.diff(close)
-  diff = np.insert(diff, 0, 0)
-  sma15 = SMA(daily_mean, timeperiod=15)
-  sma60 = SMA(daily_mean, timeperiod=60)
-  rsi = RSI(daily_mean, timeperiod=14)
-  atr = ATR(daily_mean, timeperiod=14)
+  data_dict = {}
+  for file in [btc_file, ltc_file, xrp_file, iota_file, eth_file]:
+    full_path = os.path.join(coin_path, file)
+    df = pd.read_csv(full_path, sep=',', skiprows=0, header=0, index_col=0, parse_dates=True,
+                     names=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Market Cap'])
 
-  # data = np.column_stack((close, diff, sma15, close-sma15, sma15-sma60, rsi, atr))
-  data = np.column_stack((
-    close,
-    sma15,
-    sma60,
-    rsi,
-    atr,
-    daily_mean['open'].values,
-    daily_mean['high'].values,
-    daily_mean['low'].values,
-    daily_mean['vol_btc'].values,
-    daily_mean['vol_usd'].values))
-  
-  data = np.nan_to_num(data)
+    df['Date'] = df.index
+    df.index = pd.to_datetime(df.index, unit='d')
+    df.fillna(method='ffill')
+    close = df['Close'].values.astype('float')
+    high = df['High'].values.astype('float')
+    low = df['Low'].values.astype('float')
 
-  scaler = MinMaxScaler(feature_range=(0, 1))
-  norm_data = scaler.fit_transform(data)
-  return norm_data, data, df, daily_mean
+    vol = df['Volume'].values
+    vol = [v.replace('-', '0') for v in vol]
+    vol = np.array([v.replace(',', '') for v in vol]).astype('float')
+
+    cap = df['Volume'].values
+    cap = [c.replace('-', '0') for c in cap]
+    cap = np.array([c.replace(',', '') for c in cap]).astype('float')
+
+    sma15 = talib.SMA(close, timeperiod=15)
+    sma60 = talib.SMA(close, timeperiod=60)
+    rsi = talib.RSI(close, timeperiod=14)
+    atr = talib.ATR(high, low, close, timeperiod=14)
+
+    data = np.column_stack((
+      close,
+      sma15,
+      sma60,
+      rsi,
+      atr,
+      df['Open'].values,
+      high,
+      low,
+      vol,
+      cap)
+    )
+
+    data = np.nan_to_num(data)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    norm_data = scaler.fit_transform(data)
+
+    data_dict[file] = (norm_data, data, df, close)
+
+  return data_dict
 
 
 def countNanValues(df):
@@ -215,12 +230,13 @@ def evaluate_performance(data, data_norm, model, verbose=False, plot=False):
   return totalReward, CurrentState
 
 # Params
-TRAINING_DATA_NORM, TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
+TRAINING_DATA_NORM, TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()['bitcoin_price.csv']
 num_actions = 3
 num_features = 11
 
-epochs = 10
-decay_epoch = 4
+iters = 10
+epochs = 3
+decay_epoch = 1
 epsilon = 1.0
 
 active_gamma = 0.95
@@ -229,8 +245,7 @@ passive_gamma = 0.5
 learning_progress = []
 verbose = False
 print_state = False
-params = {'starting_capital': 10000, 'starting_coin': 0.0}
-iters = 5
+params = {'starting_capital': 20000, 'starting_coin': 0.0}
 hidden_units = 32
 batch_size = 16
 xp_window_size = 32
