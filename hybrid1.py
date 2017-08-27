@@ -135,11 +135,12 @@ class State(object):
     elif self.signal[self.timestep-1] < 0:
       reward -= 2.5 / self.pvalue[self.timestep-1] # coinbase $2.50 charge
     if (self.coin == 0 or self.capital == 0):
-      reward -= 0.01
+      reward -= 0.001
     return reward * 100
 
   def getState(self):
     state = self.data_norm[self.timestep]
+    # print state
     full_state = np.concatenate((state, np.array([float(self.capital) / self.params['starting_capital']])))
     return full_state.reshape(1, 1, 11)
 
@@ -166,6 +167,7 @@ def load_data():
 
     df['Date'] = df.index
     df.index = pd.to_datetime(df.index, unit='d')
+    df = df.sort_values(by='Date')
     df.fillna(method='ffill')
     close = df['Close'].values.astype('float')
     high = df['High'].values.astype('float')
@@ -201,7 +203,7 @@ def load_data():
     scaler = MinMaxScaler(feature_range=(0, 1))
     norm_data = scaler.fit_transform(data)
 
-    data_dict[file] = (norm_data, data, df, close)
+    data_dict[file] = (norm_data, data, df)
 
   return data_dict
 
@@ -210,7 +212,7 @@ def countNanValues(df):
 	return df.isnull().sum()
 
 
-def evaluate_performance(data, data_norm, model, verbose=False, plot=False):
+def evaluate_performance(data, data_norm, model, df, verbose=False, plot=False):
   CurrentState = State(data, data_norm, params)
   totalReward = 0
 
@@ -226,11 +228,11 @@ def evaluate_performance(data, data_norm, model, verbose=False, plot=False):
     if verbose: print 'Reward:', reward
     totalReward += reward
 
-  if plot: plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal, title='Performance Evaluation (Deterministic)')
+  if plot: plot_trades(df['Close'], CurrentState.signal, title='Performance Evaluation (Deterministic)')
   return totalReward, CurrentState
 
 # Params
-TRAINING_DATA_NORM, TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()['bitcoin_price.csv']
+TRAINING_DATA_NORM, TRAINING_DATA, DATAFRAME = load_data()['bitcoin_price.csv']
 num_actions = 3
 num_features = 11
 
@@ -317,7 +319,7 @@ for iteration in range(iters): # each iteration switches between the two models
         X_batch, y_batch = ExpReplay.getBatch(batch_size)
         UpdateModel.fit(X_batch, y_batch, batch_size=batch_size, epochs=1, verbose=0)
 
-    totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel, plot=(epoch==epochs-1))
+    totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel, DATAFRAME, plot=(epoch==epochs-1))
     signal_list.append(CurrentState.signal)
     print '[Main Loop] Epoch #%d Total Reward: %f Epsilon: %f' % (epoch, totalReward, epsilon)
     print '[Main Loop] Final state:', finalState
@@ -332,7 +334,7 @@ for iteration in range(iters): # each iteration switches between the two models
 
   # swap the pair of models
   PredictModel, UpdateModel = UpdateModel, PredictModel
-  # plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
+  # plot_trades(pd.Series(PRICE_SERIES['close']), signal_list[-1])
 
 # plot the last (hopefully best) set of signals against price
-# plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
+# plot_trades(pd.Series(PRICE_SERIES['close']), signal_list[-1])
