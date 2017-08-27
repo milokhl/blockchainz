@@ -19,7 +19,8 @@ from collections import deque
 
 matplotlib.style.use('ggplot')
 
-def plot_trades(price_series, signal_series):
+
+def plot_trades(price_series, signal_series, title='Trading Signal'):
   price_series.plot(style='x-')
 
   none = signal_series == 0
@@ -39,7 +40,9 @@ def plot_trades(price_series, signal_series):
   if sell_idx.any():
     price_series[sell_idx].plot(style='go')
 
+  plt.title(title)
   plt.show()
+
 
 class ExperienceReplay(object):
   def __init__(self, window_size, num_features, num_actions):
@@ -145,7 +148,7 @@ class State(object):
   def __repr__(self):
     close = self.data[self.timestep][0]
     assets = self.capital + self.coin * close
-    return 'Timestep: %d Capital: %f Coin: %f Close: %f Assets: %f' % (self.timestep, self.capital, self.coin, close, self.pvalue[self.timestep])
+    return 'Timestep: %d Capital: %f Coin: %f Close: %f Pvalue: %f' % (self.timestep, self.capital, self.coin, close, self.pvalue[self.timestep])
 
 
 def load_data():
@@ -169,16 +172,17 @@ def load_data():
   atr = ATR(daily_mean, timeperiod=14)
 
   # data = np.column_stack((close, diff, sma15, close-sma15, sma15-sma60, rsi, atr))
-  data = np.column_stack((close,
-                          sma15,
-                          sma60,
-                          rsi,
-                          atr,
-                          daily_mean['open'].values,
-                          daily_mean['high'].values,
-                          daily_mean['low'].values,
-                          daily_mean['vol_btc'].values,
-                          daily_mean['vol_usd'].values))
+  data = np.column_stack((
+    close,
+    sma15,
+    sma60,
+    rsi,
+    atr,
+    daily_mean['open'].values,
+    daily_mean['high'].values,
+    daily_mean['low'].values,
+    daily_mean['vol_btc'].values,
+    daily_mean['vol_usd'].values))
   
   data = np.nan_to_num(data)
 
@@ -191,37 +195,41 @@ def countNanValues(df):
 	return df.isnull().sum()
 
 
-def evaluate_performance(data, data_norm, model, verbose=False):
-  if verbose: print '----- Evaluating performance -----'
+def evaluate_performance(data, data_norm, model, verbose=False, plot=False):
   CurrentState = State(data, data_norm, params)
   totalReward = 0
 
   for step in range(data.shape[0]-1):
-    state = CurrentState.getState() # (price, diff)
+    state = CurrentState.getState()
     Q_values = model.predict(state)
     action_id = np.argmax(Q_values)
-    if verbose: print 'State:', CurrentState
-    if verbose: print 'Qvalues:', Q_values
-    if verbose: print 'Action:', action_id
+    if verbose: print '[Eval] State:', CurrentState
+    if verbose: print '[Eval] Qvalues:', Q_values
+    if verbose: print '[Eval] Action:', action_id
     CurrentState.simulateAction(action_id)
     reward = CurrentState.getReward()
     if verbose: print 'Reward:', reward
     totalReward += reward
 
-  if verbose: plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal)
+  if plot: plot_trades(pd.Series(BTC_DATA_DAY['close']), CurrentState.signal, title='Performance Evaluation (Deterministic)')
   return totalReward, CurrentState
 
 # Params
 TRAINING_DATA_NORM, TRAINING_DATA, BTC_DATA_MIN, BTC_DATA_DAY = load_data()
 num_actions = 3
 num_features = 11
+
 epochs = 10
-gamma = 0.93
+decay_epoch = 4
 epsilon = 1.0
+
+active_gamma = 0.95
+passive_gamma = 0.5
+
 learning_progress = []
 verbose = False
 print_state = False
-params = {'starting_capital': 10000, 'starting_coin': 0.5}
+params = {'starting_capital': 10000, 'starting_coin': 0.0}
 iters = 5
 hidden_units = 32
 batch_size = 16
@@ -281,7 +289,11 @@ for iteration in range(iters): # each iteration switches between the two models
         next_state = CurrentState.getState()
         Q_values_next = PredictModel.predict(next_state)
         Q_max = np.max(Q_values_next)
-        y[0][action_id] = reward + (gamma * Q_max)
+
+        if action_id == 0:
+          y[0][action_id] = reward + (passive_gamma * Q_max)
+        else:
+          y[0][action_id] = reward + (active_gamma * Q_max)
 
       # get a batch from the experience replay and fit
       ExpReplay.bufferAppend((state, y, Q_values)) # state, actual, predicted
@@ -290,18 +302,22 @@ for iteration in range(iters): # each iteration switches between the two models
         X_batch, y_batch = ExpReplay.getBatch(batch_size)
         UpdateModel.fit(X_batch, y_batch, batch_size=batch_size, epochs=1, verbose=0)
 
-    totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel)
+    totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel, plot=(epoch==epochs-1))
     signal_list.append(CurrentState.signal)
-    print('Epoch #%d Total Reward: %f Epsilon: %f' % (epoch, totalReward, epsilon))
-    print finalState
+    print '[Main Loop] Epoch #%d Total Reward: %f Epsilon: %f' % (epoch, totalReward, epsilon)
+    print '[Main Loop] Final state:', finalState
 
     # slowly reduce epsilon as model gets smarter
-    if epsilon > 0.2:
-      epsilon -= (1.0/epochs)
+    # if epsilon > 0.2:
+    #   epsilon -= (1.0/epochs)
+
+    # 1, 1, 1, 1, 0.5, 0.33, 0.25, 0.2, 0.16, 0.14
+    if epoch >= decay_epoch:
+      epsilon = 1.0 / (epoch - decay_epoch + 2)
 
   # swap the pair of models
   PredictModel, UpdateModel = UpdateModel, PredictModel
-  plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
+  # plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
 
 # plot the last (hopefully best) set of signals against price
-plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
+# plot_trades(pd.Series(BTC_DATA_DAY['close']), signal_list[-1])
