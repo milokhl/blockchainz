@@ -8,6 +8,10 @@ from keras.models import Sequential
 from keras.layers.core import Dense, Dropout, Activation
 from keras.optimizers import RMSprop, Adam
 from keras.layers.recurrent import LSTM
+from keras import regularizers
+
+from keras.layers import Input, Dense
+from keras.models import Model
 
 from sklearn.preprocessing import MinMaxScaler
 
@@ -58,13 +62,17 @@ class ExperienceReplay(object):
     error = np.linalg.norm(item[2] - item[1])
     self.weights.append(error)
 
-  def getBatch(self, batch_size):
+  def getBatch(self, batch_size, weighted=True):
     normalized_weights = self.weights / np.sum(self.weights)
-    indices = np.random.choice(len(self.weights), batch_size, p=normalized_weights)
-    X = np.zeros((batch_size, 1, num_features))
-    y = np.zeros((batch_size, num_actions))
+    if weighted:
+      indices = np.random.choice(len(self.weights), batch_size, p=normalized_weights)
+    else:
+      indices = np.random.choice(len(self.weights), batch_size)
+    X = np.zeros((batch_size, self.num_features))
+    y = np.zeros((batch_size, self.num_actions))
     ctr = 0
     for i in indices:
+      # print 'X:', X.shape, 'Buffer item:', self.buffer[i][0].shape
       X[ctr] = self.buffer[i][0]
       y[ctr] = self.buffer[i][1]
       ctr += 1
@@ -134,15 +142,23 @@ class State(object):
       reward -= (0.01 * abs(self.signal[self.timestep-1]) * prev_close) / self.pvalue[self.timestep-1]
     elif self.signal[self.timestep-1] < 0:
       reward -= 2.5 / self.pvalue[self.timestep-1] # coinbase $2.50 charge
+    
     if (self.coin == 0 or self.capital == 0):
-      reward -= 0.001
+      reward -= 0.002
+    # else:
+    #   # diversification penalty
+    #   ratio = max((self.coin * close) / self.capital, self.capital / (self.coin * close))
+    #   penalty = (min(ratio, 10.0) - 1) / 900.0 # if ratio 
+    #   reward -= penalty
+
     return reward * 100
 
   def getState(self):
     state = self.data_norm[self.timestep]
     # print state
-    full_state = np.concatenate((state, np.array([float(self.capital) / self.params['starting_capital']])))
-    return full_state.reshape(1, 1, 11)
+    # full_state = np.concatenate((state, np.array([float(self.capital) / self.params['starting_capital']])))
+    # return full_state.reshape(1, 1, 11)
+    return state.reshape(1, 1, 10)
 
   def __repr__(self):
     close = self.data[self.timestep][0]
@@ -231,60 +247,127 @@ def evaluate_performance(data, data_norm, model, df, verbose=False, plot=False):
   if plot: plot_trades(df['Close'], CurrentState.signal, title='Performance Evaluation (Deterministic)')
   return totalReward, CurrentState
 
+def evaluate_performance_hybrid(data, data_norm, model, df, verbose=False, plot=False):
+  CurrentState = State(data, data_norm, params)
+  totalReward = 0
+
+  for step in range(data.shape[0]-1):
+    state = CurrentState.getState()
+    state_prediction, state_embedding = model['prediction_model'].predict(state)
+    Q_values = model['action_model'].predict(state_embedding.reshape(1, state_embedding.shape[2]))
+    action_id = np.argmax(Q_values)
+    if verbose: print '[Eval] State:', CurrentState
+    if verbose: print '[Eval] Qvalues:', Q_values
+    if verbose: print '[Eval] Action:', action_id
+    CurrentState.simulateAction(action_id)
+    reward = CurrentState.getReward()
+    if verbose: print 'Reward:', reward
+    totalReward += reward
+
+  if plot: plot_trades(df['Close'], CurrentState.signal, title='Performance Evaluation (Deterministic)')
+  return totalReward, CurrentState
+
 # Params
-TRAINING_DATA_NORM, TRAINING_DATA, DATAFRAME = load_data()['bitcoin_price.csv']
+ALL_DATA = load_data()
+TRAINING_DATA_NORM, TRAINING_DATA, DATAFRAME = ALL_DATA['bitcoin_price.csv']
 num_actions = 3
 num_features = 11
 
 iters = 10
-epochs = 3
-decay_epoch = 1
+epochs = 10
+decay_epoch = 4
 epsilon = 1.0
 
 active_gamma = 0.95
-passive_gamma = 0.5
+passive_gamma = 0.4
 
 learning_progress = []
 verbose = False
 print_state = False
 params = {'starting_capital': 20000, 'starting_coin': 0.0}
-hidden_units = 32
+hidden_units = 64
 batch_size = 16
 xp_window_size = 32
 
-from keras.layers import Input, Dense
-from keras.models import Model
+state_embedding_size=10
 
 def build_model():
   inputs = Input(shape=(1, num_features,))
-  x = LSTM(hidden_units, input_shape=(1, num_features), return_sequences=True)(inputs)
-  x = LSTM(hidden_units, return_sequences=True)(x)
-  x = LSTM(hidden_units, return_sequences=True)(x)
-  x = LSTM(hidden_units)(x)
+  x = LSTM(hidden_units, input_shape=(1, num_features), return_sequences=True, kernel_regularizer=regularizers.l2(0.01))(inputs)
+  x = LSTM(hidden_units, return_sequences=True, kernel_regularizer=regularizers.l2(0.01), activation='relu')(x)
+  x = LSTM(hidden_units, return_sequences=True, kernel_regularizer=regularizers.l2(0.01), activation='relu')(x)
+  x = LSTM(hidden_units, kernel_regularizer=regularizers.l2(0.01), activation='relu')(x)
   x = Dense(hidden_units, activation='relu', kernel_initializer='lecun_uniform')(x)
   actions = Dense(num_actions, activation='linear', name='actions_output')(x)
   model = Model(inputs=inputs, outputs=actions)
-  optimizer = Adam(lr=0.0005, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+  optimizer = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
   model.compile(optimizer=optimizer, loss='mse')
   return model
 
-Model1 = build_model()
-Model2 = build_model()
+def build_model_2():
+  inputs = Input(shape=(1, num_features,))
+  x = Dense(64, activation='relu', kernel_initializer='lecun_uniform')(inputs)
+  x = Dense(32, activation='relu', kernel_initializer='lecun_uniform')(x)
+  x = Dense(16, activation='relu', kernel_initializer='lecun_uniform')(x)
+  x = LSTM(16, return_sequences=True, kernel_regularizer=regularizers.l2(0.01))(x)
+  x = LSTM(16, return_sequences=True, kernel_regularizer=regularizers.l2(0.01))(x)
+  x = LSTM(16, kernel_regularizer=regularizers.l2(0.01))(x)
+  actions = Dense(num_actions, activation='linear', name='actions_output')(x)
+  model = Model(inputs=inputs, outputs=actions)
+  optimizer = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+  model.compile(optimizer=optimizer, loss='mse')
+  return model
 
-PredictModel = Model1
-UpdateModel = Model2
+def hybrid_model():
+  num_features = 10
+  state_embedding_size = 10
+
+  inputs = Input(shape=(1, num_features,))
+  x = LSTM(32, input_shape=(1, num_features), return_sequences=True, kernel_regularizer=regularizers.l2(0.01))(inputs)
+  x = LSTM(16, return_sequences=True, kernel_regularizer=regularizers.l2(0.01), activation='relu')(x)
+  x = LSTM(16, return_sequences=True, kernel_regularizer=regularizers.l2(0.01), activation='relu')(x)
+  state_embedding = Dense(state_embedding_size, activation='linear', name='state_emb')(x)
+  x = Dense(16, activation='relu')(state_embedding)
+  x = Dense(16, activation='relu')(x)
+  state_prediction = Dense(num_features, activation='linear', name='state_pred')(x)
+
+  # DQN
+  dqn_input = Input(shape=(state_embedding_size,))
+  dqn = Dense(16, activation='relu')(dqn_input)
+  dqn = Dense(16, activation='relu')(dqn)
+  dqn = Dense(16, activation='relu')(dqn)
+  actions = Dense(num_actions, activation='linear')(dqn)
+
+  prediction_model = Model(inputs=inputs, outputs=[state_prediction, state_embedding])
+  action_model = Model(inputs=dqn_input, outputs=actions)
+
+  optimizer = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-08, decay=0.0)
+  prediction_model.compile(optimizer=optimizer, loss='mse', loss_weights={'state_emb': 0, 'state_pred': 1.0})
+  action_model.compile(optimizer=optimizer, loss='mse')
+  return {'prediction_model': prediction_model, 'action_model': action_model}
+
+# Model1 = build_model()
+# Model2 = build_model()
+
+# PredictModel = Model1
+# UpdateModel = Model2
+Model = hybrid_model()
 
 # main loop
 for iteration in range(iters): # each iteration switches between the two models
+  print '------ ITERATION %d -------' % iteration
   epsilon = 1.0
   signal_list = []
   for epoch in range(epochs): # each epoch is one progression through the training data
+    totalEpochReward = 0
     CurrentState = State(TRAINING_DATA, TRAINING_DATA_NORM, params)
-    ExpReplay = ExperienceReplay(xp_window_size, num_features, num_actions)
+    ExpReplay = ExperienceReplay(xp_window_size, state_embedding_size, num_actions)
 
     for step in range(TRAINING_DATA.shape[0]-1):
       state = CurrentState.getState()
-      Q_values = PredictModel.predict(state)
+
+      state_prediction, state_embedding = Model['prediction_model'].predict(state)
+      Q_values = Model['action_model'].predict(state_embedding.reshape((1, state_embedding.shape[2])))
 
       if (random.random() < epsilon):
         action_id = np.random.randint(0, num_actions)
@@ -294,6 +377,7 @@ for iteration in range(iters): # each iteration switches between the two models
       # go to the next state by performing action
       CurrentState.simulateAction(action_id)
       reward = CurrentState.getReward()
+      totalEpochReward += reward
 
       y = np.copy(Q_values)
 
@@ -304,7 +388,12 @@ for iteration in range(iters): # each iteration switches between the two models
       # total reward = immediate reward + discounted reward at next state
       else:
         next_state = CurrentState.getState()
-        Q_values_next = PredictModel.predict(next_state)
+
+        # fit the prediction model
+        Model['prediction_model'].fit(state, {'state_pred': next_state, 'state_emb': state_embedding}, batch_size=1, epochs=1, verbose=0)
+
+        next_state_pred, next_state_emb = Model['prediction_model'].predict(next_state)
+        Q_values_next = Model['action_model'].predict(next_state_emb.reshape((1, next_state_emb.shape[2])))
         Q_max = np.max(Q_values_next)
 
         if action_id == 0:
@@ -313,28 +402,91 @@ for iteration in range(iters): # each iteration switches between the two models
           y[0][action_id] = reward + (active_gamma * Q_max)
 
       # get a batch from the experience replay and fit
-      ExpReplay.bufferAppend((state, y, Q_values)) # state, actual, predicted
+      ExpReplay.bufferAppend((state_embedding, y, Q_values)) # state, actual, predicted
 
       if len(ExpReplay.buffer) >= batch_size:
-        X_batch, y_batch = ExpReplay.getBatch(batch_size)
-        UpdateModel.fit(X_batch, y_batch, batch_size=batch_size, epochs=1, verbose=0)
+        X_batch, y_batch = ExpReplay.getBatch(batch_size, weighted=False)
+        Model['action_model'].fit(X_batch, y_batch, batch_size=batch_size, epochs=1, verbose=0)
 
-    totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel, DATAFRAME, plot=(epoch==epochs-1))
     signal_list.append(CurrentState.signal)
-    print '[Main Loop] Epoch #%d Total Reward: %f Epsilon: %f' % (epoch, totalReward, epsilon)
-    print '[Main Loop] Final state:', finalState
+    print '[Main Loop] Epoch #%d Total Reward: %f Epsilon: %f' % (epoch, totalEpochReward, epsilon)
 
-    # slowly reduce epsilon as model gets smarter
-    # if epsilon > 0.2:
-    #   epsilon -= (1.0/epochs)
+    if epoch >= (decay_epoch-1):
+      if epsilon > 0.2:
+        epsilon -= 1.0 / epochs
+      # epsilon = 1.0 / (epoch - decay_epoch + 2)
 
-    # 1, 1, 1, 1, 0.5, 0.33, 0.25, 0.2, 0.16, 0.14
-    if epoch >= decay_epoch:
-      epsilon = 1.0 / (epoch - decay_epoch + 2)
+  totalReward, finalState = evaluate_performance_hybrid(TRAINING_DATA, TRAINING_DATA_NORM, Model, DATAFRAME, plot=True)
+  print '[Main Loop] Iteration #%d Total Reward: %f Epsilon: %f' % (iteration, totalReward, epsilon)
+  print '[Main Loop] Final state:', finalState
 
-  # swap the pair of models
-  PredictModel, UpdateModel = UpdateModel, PredictModel
+# # main loop
+# for iteration in range(iters): # each iteration switches between the two models
+#   print '------ ITERATION %d -------' % iteration
+#   epsilon = 1.0
+#   signal_list = []
+#   for epoch in range(epochs): # each epoch is one progression through the training data
+#     totalEpochReward = 0
+#     CurrentState = State(TRAINING_DATA, TRAINING_DATA_NORM, params)
+#     ExpReplay = ExperienceReplay(xp_window_size, num_features, num_actions)
+
+#     for step in range(TRAINING_DATA.shape[0]-1):
+#       state = CurrentState.getState()
+#       Q_values = PredictModel.predict(state)
+
+#       if (random.random() < epsilon):
+#         action_id = np.random.randint(0, num_actions)
+#       else:
+#         action_id = np.argmax(Q_values)
+
+#       # go to the next state by performing action
+#       CurrentState.simulateAction(action_id)
+#       reward = CurrentState.getReward()
+#       totalEpochReward += reward
+
+#       y = np.copy(Q_values)
+
+#       # if terminal state, no discounted future reward
+#       if CurrentState.timestep == (CurrentState.steps-1):
+#         y[0][action_id] = reward # zero index needed because array is 2D
+
+#       # total reward = immediate reward + discounted reward at next state
+#       else:
+#         next_state = CurrentState.getState()
+#         Q_values_next = PredictModel.predict(next_state)
+#         Q_max = np.max(Q_values_next)
+
+#         if action_id == 0:
+#           y[0][action_id] = reward + (passive_gamma * Q_max)
+#         else:
+#           y[0][action_id] = reward + (active_gamma * Q_max)
+
+#       # get a batch from the experience replay and fit
+#       ExpReplay.bufferAppend((state, y, Q_values)) # state, actual, predicted
+
+#       if len(ExpReplay.buffer) >= batch_size:
+#         X_batch, y_batch = ExpReplay.getBatch(batch_size, weighted=False)
+#         UpdateModel.fit(X_batch, y_batch, batch_size=batch_size, epochs=1, verbose=0)
+
+#     signal_list.append(CurrentState.signal)
+#     print '[Main Loop] Epoch #%d Total Reward: %f Epsilon: %f' % (epoch, totalEpochReward, epsilon)
+
+#     if epoch >= (decay_epoch-1):
+#       if epsilon > 0.2:
+#         epsilon -= 1.0 / epochs
+#       # epsilon = 1.0 / (epoch - decay_epoch + 2)
+
+#   totalReward, finalState = evaluate_performance(TRAINING_DATA, TRAINING_DATA_NORM, UpdateModel, DATAFRAME, plot=True)
+#   print '[Main Loop] Iteration #%d Total Reward: %f Epsilon: %f' % (iteration, totalReward, epsilon)
+#   print '[Main Loop] Final state:', finalState
+
+#   # swap the pair of models
+#   PredictModel, UpdateModel = UpdateModel, PredictModel
   # plot_trades(pd.Series(PRICE_SERIES['close']), signal_list[-1])
 
-# plot the last (hopefully best) set of signals against price
 # plot_trades(pd.Series(PRICE_SERIES['close']), signal_list[-1])
+
+# evaluate performance on litecoin
+print "Testing with LTC"
+LTC_TRAINING_DATA_NORM, LTC_TRAINING_DATA, LTC_DATAFRAME = ALL_DATA['litecoin_price.csv']
+evaluate_performance(LTC_TRAINING_DATA, LTC_TRAINING_DATA_NORM, UpdateModel, LTC_DATAFRAME, plot=True)
